@@ -4,12 +4,10 @@ import os
 import zipfile
 import numpy as np
 import pandas as pd
-import rasterio
-from rasterio.transform import from_origin
-from rasterio.mask import mask
 from shapely.geometry import Polygon
 from scipy.interpolate import LinearNDInterpolator
 import matplotlib.pyplot as plt
+from matplotlib.path import Path
 
 # -------------------------
 # CONFIG
@@ -18,7 +16,6 @@ PIXEL_SIZE = 0.05
 N_CLASSES = 15
 
 st.set_page_config(page_title="TSF Analysis Tool", layout="wide")
-
 st.title("📊 TSF Freeboard & Deposition Analysis")
 
 # -------------------------
@@ -33,15 +30,18 @@ water_level = st.number_input("Water Level", value=1250.0)
 # -------------------------
 # FUNCTIONS
 # -------------------------
-def load_xyz(file):
-    df = pd.read_csv(file)
+def load_xyz(file_path):
+    df = pd.read_csv(file_path)
     return df["X"].values, df["Y"].values, df["Z"].values
 
-def load_xy(file):
-    df = pd.read_csv(file)
+def load_xy(file_path):
+    df = pd.read_csv(file_path)
     return df[["X", "Y"]].values
 
-def create_raster(x, y, z, output_path):
+# -------------------------
+# GRID INTERPOLATION (TIN-like)
+# -------------------------
+def create_grid(x, y, z):
     interp = LinearNDInterpolator(list(zip(x, y)), z)
 
     xmin, xmax = x.min(), x.max()
@@ -49,86 +49,48 @@ def create_raster(x, y, z, output_path):
 
     xi = np.arange(xmin, xmax, PIXEL_SIZE)
     yi = np.arange(ymin, ymax, PIXEL_SIZE)
-    xi, yi = np.meshgrid(xi, yi)
 
+    xi, yi = np.meshgrid(xi, yi)
     zi = interp(xi, yi)
 
-    transform = from_origin(xmin, ymax, PIXEL_SIZE, PIXEL_SIZE)
+    return xi, yi, zi
 
-    with rasterio.open(
-        output_path,
-        "w",
-        driver="GTiff",
-        height=zi.shape[0],
-        width=zi.shape[1],
-        count=1,
-        dtype="float32",
-        crs="EPSG:32735",
-        transform=transform,
-        nodata=np.nan
-    ) as dst:
-        dst.write(zi.astype("float32"), 1)
+# -------------------------
+# POLYGON MASK (no rasterio needed)
+# -------------------------
+def mask_grid(xi, yi, zi, polygon_xy):
+    poly_path = Path(polygon_xy)
 
-    return output_path
+    points = np.vstack((xi.flatten(), yi.flatten())).T
+    mask = poly_path.contains_points(points).reshape(xi.shape)
 
-def clip_raster(raster_path, polygon, output_path):
-    with rasterio.open(raster_path) as src:
-        out_image, out_transform = mask(src, [polygon], crop=True)
-        out_meta = src.meta.copy()
+    zi_masked = np.where(mask, zi, np.nan)
 
-    out_meta.update({
-        "height": out_image.shape[1],
-        "width": out_image.shape[2],
-        "transform": out_transform
-    })
+    return zi_masked
 
-    with rasterio.open(output_path, "w", **out_meta) as dest:
-        dest.write(out_image)
+# -------------------------
+# ANALYSIS
+# -------------------------
+def freeboard_map(grid, water_level):
+    return water_level - grid
 
-    return output_path
+def deposition_map(new_grid, old_grid):
+    return new_grid - old_grid
 
-def save_raster(data, ref, output_path):
-    with rasterio.open(
-        output_path,
-        "w",
-        driver="GTiff",
-        height=data.shape[0],
-        width=data.shape[1],
-        count=1,
-        dtype="float32",
-        crs=ref.crs,
-        transform=ref.transform,
-        nodata=np.nan
-    ) as dst:
-        dst.write(data.astype("float32"), 1)
-
-    return output_path
-
-def freeboard_map(raster_path, water_level, output_path):
-    with rasterio.open(raster_path) as src:
-        data = src.read(1)
-        result = water_level - data
-        return save_raster(result, src, output_path)
-
-def deposition_map(new_path, old_path, output_path):
-    with rasterio.open(new_path) as n, rasterio.open(old_path) as o:
-        result = n.read(1) - o.read(1)
-        return save_raster(result, n, output_path)
-
-def save_plot(raster_path, output_png):
-    with rasterio.open(raster_path) as src:
-        data = src.read(1)
-
-    plt.figure(figsize=(6, 4))
+# -------------------------
+# PLOTTING
+# -------------------------
+def save_plot(data, path, title):
+    plt.figure(figsize=(7, 5))
     plt.imshow(data, cmap="viridis")
     plt.colorbar()
-    plt.title(os.path.basename(raster_path))
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(output_png)
+    plt.savefig(path, dpi=150)
     plt.close()
 
 # -------------------------
-# PROCESS BUTTON
+# PROCESS
 # -------------------------
 if st.button("Run Analysis"):
 
@@ -139,7 +101,7 @@ if st.button("Run Analysis"):
 
             st.info("Processing...")
 
-            # Save uploaded files
+            # Save uploads
             prev_path = os.path.join(tmp, "prev.csv")
             new_path = os.path.join(tmp, "new.csv")
             string_path = os.path.join(tmp, "string.csv")
@@ -156,30 +118,28 @@ if st.button("Run Analysis"):
             nx, ny, nz = load_xyz(new_path)
             string_xy = load_xy(string_path)
 
-            # Interpolate
-            prev_raster = create_raster(px, py, pz, f"{tmp}/prev.tif")
-            new_raster = create_raster(nx, ny, nz, f"{tmp}/new.tif")
+            # Interpolate grids
+            px_i, py_i, prev_grid = create_grid(px, py, pz)
+            nx_i, ny_i, new_grid = create_grid(nx, ny, nz)
 
-            # Polygon
-            polygon = Polygon(string_xy)
-
-            # Clip
-            prev_clip = clip_raster(prev_raster, polygon, f"{tmp}/prev_clip.tif")
-            new_clip = clip_raster(new_raster, polygon, f"{tmp}/new_clip.tif")
+            # Mask with polygon
+            prev_grid = mask_grid(px_i, py_i, prev_grid, string_xy)
+            new_grid = mask_grid(nx_i, ny_i, new_grid, string_xy)
 
             # Analysis
-            freeboard = freeboard_map(new_clip, water_level, f"{tmp}/freeboard.tif")
-            deposition = deposition_map(new_clip, prev_clip, f"{tmp}/deposition.tif")
+            freeboard = freeboard_map(new_grid, water_level)
+            deposition = deposition_map(new_grid, prev_grid)
 
-            # Visuals
-            free_png = f"{tmp}/freeboard.png"
-            dep_png = f"{tmp}/deposition.png"
+            # Outputs
+            free_png = os.path.join(tmp, "freeboard.png")
+            dep_png = os.path.join(tmp, "deposition.png")
 
-            save_plot(freeboard, free_png)
-            save_plot(deposition, dep_png)
+            save_plot(freeboard, free_png, "Freeboard Map")
+            save_plot(deposition, dep_png, "Deposition Map")
 
-            # Show previews
+            # Preview
             st.subheader("Results Preview")
+
             col1, col2 = st.columns(2)
 
             with col1:
@@ -188,14 +148,14 @@ if st.button("Run Analysis"):
             with col2:
                 st.image(dep_png, caption="Deposition Map")
 
-            # Zip results
-            zip_path = f"{tmp}/results.zip"
-            with zipfile.ZipFile(zip_path, "w") as z:
-                for file in os.listdir(tmp):
-                    if file != "results.zip":
-                        z.write(os.path.join(tmp, file), file)
+            # ZIP outputs
+            zip_path = os.path.join(tmp, "results.zip")
 
-            # Download button
+            with zipfile.ZipFile(zip_path, "w") as z:
+                z.write(free_png, "freeboard.png")
+                z.write(dep_png, "deposition.png")
+
+            # Download
             with open(zip_path, "rb") as f:
                 st.download_button(
                     label="⬇️ Download Results ZIP",
