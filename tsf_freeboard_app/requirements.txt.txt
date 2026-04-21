@@ -1,6 +1,6 @@
 streamlit
 numpy
 pandas
-shapely
+shapely==2.0.3
 scipy
 matplotlib
