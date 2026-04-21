@@ -1,0 +1,7 @@
+streamlit
+numpy
+pandas
+rasterio==1.3.9
+shapely
+scipy
+matplotlib
